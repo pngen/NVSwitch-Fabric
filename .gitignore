@@ -1,0 +1,23 @@
+# Build trees
+/build/
+/build-debug/
+/build-asan/
+/build-*/
+/cmake-build-*/
+
+# Test/temp state files
+*.nvf
+*.tmp
+*.pdb
+*.obj
+*.ilk
+*.exp
+
+# IDE
+.vs/
+.vscode/
+*.VC.db
+*.VC.opendb
+
+# Windows
+Thumbs.db
