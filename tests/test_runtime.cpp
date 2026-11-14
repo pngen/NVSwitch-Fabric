@@ -97,6 +97,9 @@ TEST_CASE(runtime_worker_death_invalidates) {
 TEST_CASE(runtime_coordinator_restart_revalidation) {
     uint16_t port = findFreePort();
     std::string persist = "test_coord_state.nvf";
+    // Start from no persisted state: a previous run leaves its state file (saved under a later
+    // epoch) in this working directory, and the first coordinator must not restore it.
+    std::remove(persist.c_str());
     Proc coord1, wp1;
     CHECK(spawnProc(kMaybeCoord, std::to_string(port) + " " + persist + " 1", coord1));
     CHECK(spawnProc(kMaybeWorker, "127.0.0.1 " + std::to_string(port) + " w1 10 1 1 1", wp1));
@@ -124,6 +127,7 @@ TEST_CASE(runtime_coordinator_restart_revalidation) {
     }
     CHECK(allowed);
     killProc(wp2); killProc(coord2);
+    std::remove(persist.c_str());
 }
 
 

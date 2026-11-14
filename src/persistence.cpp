@@ -3,7 +3,9 @@
 #include "nvswitch_fabric/topology.h"
 #include "nvswitch_fabric/records.h"
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <system_error>
 
 namespace nvswitch_fabric {
 
@@ -190,11 +192,21 @@ Result<FabricTopology> Persistence::decodeTopologyPayload(ByteReader& r) {
 }
 
 namespace { // anon (writeFileAtomic)
-void writeFileAtomic(const std::string& path, const std::vector<uint8_t>& data) {
-    std::string tmp = path + ".tmp";
-    { std::ofstream f(tmp, std::ios::binary | std::ios::trunc); f.write((const char*)data.data(), (std::streamsize)data.size()); }
-    std::remove(path.c_str());
-    std::rename(tmp.c_str(), path.c_str());
+// Writes a temp file and atomically replaces the target (MoveFileEx with REPLACE_EXISTING on
+// Windows). The previous state file is never removed first, and any failure is reported.
+bool writeFileAtomic(const std::string& path, const std::vector<uint8_t>& data) {
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f.write((const char*)data.data(), (std::streamsize)data.size());
+        f.flush();
+        if (!f.good()) { f.close(); std::error_code ignored; std::filesystem::remove(tmp, ignored); return false; }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) { std::error_code ignored; std::filesystem::remove(tmp, ignored); return false; }
+    return true;
 }
 } // namespace
 
@@ -216,7 +228,7 @@ Result<void> Persistence::serializeToFile(const FabricRegistry& reg, const std::
     if (!res.ok()) return Err(res.error());
     const auto& data = res.value();
     if (data.size() > limits::kMaxPersistenceBytes) return Err(err(ErrorCode::RESOURCE_LIMIT, "persistence too large"));
-    writeFileAtomic(path, data);
+    if (!writeFileAtomic(path, data)) return Err(err(ErrorCode::BACKEND_ERROR, "cannot write persistence file"));
     return Ok();
 }
 Result<std::shared_ptr<FabricRegistry>> Persistence::deserializeFromFile(const std::string& path) {

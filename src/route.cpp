@@ -336,6 +336,13 @@ bool routeDecisionStillAuthoritative(const RouteDecision& d, const FabricTopolog
             if (!usableState(pr->state)) return false;
             if (pr->gen.get() != g.get()) return false;
         }
+        // Every link on the path must still exist and be traversable: a link taken DOWN or
+        // removed since the decision leaves its switches and ports unchanged.
+        for (const auto& lid : p.links) {
+            auto l = topo.lookupLink(lid);
+            if (!l) return false;
+            if (!usableState(l->state)) return false;
+        }
     }
     return true;
 }

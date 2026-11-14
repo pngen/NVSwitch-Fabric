@@ -1,20 +1,23 @@
 // NVSwitch Fabric - wire codec implementation.
 #include "nvswitch_fabric/wire.h"
+#include <array>
 #include <cstring>
 
 namespace nvswitch_fabric {
 
 uint32_t crc32(const uint8_t* data, size_t len) {
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
+    // Built once with thread-safe static initialization: the coordinator computes CRCs on several
+    // connection threads at once, and a lazily filled table raced (a thread could see the table
+    // marked ready before it was written).
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t{};
         for (uint32_t i = 0; i < 256; ++i) {
             uint32_t c = i;
             for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
+            t[i] = c;
         }
-        init = true;
-    }
+        return t;
+    }();
     uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; ++i) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
     return crc ^ 0xFFFFFFFFu;

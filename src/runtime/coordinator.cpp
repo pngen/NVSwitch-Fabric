@@ -119,12 +119,35 @@ size_t Coordinator::liveConnections() const {
 }
 
 void Coordinator::applyWorkerTopology(const FabricTopology& topo, const WorkerId& worker, WorkerBootId boot) {
+    // A record still held by an earlier incarnation of this worker (possibly invalidated when it
+    // died, which advanced its generation) is taken over at a strictly newer generation: the new
+    // incarnation does not know those generations, the monotonic check would otherwise reject its
+    // whole publication, and decisions made under the old incarnation must not match it.
+    const auto cur = registry_.snapshot();
+    auto takeover = [&](const auto& old) { return old.workerKnown && old.worker == worker && old.workerBoot != boot; };
+    auto lift = [](auto& gen, const auto& oldGen) { if (gen.get() <= oldGen.get()) gen = oldGen.next(); };
     FabricRegistry::BulkEdit e;
     for (const auto& [id, d] : topo.devices()) { DeviceRecord r = d; r.workerKnown = true; r.worker = worker; r.workerBoot = boot; e.devices.push_back(r); }
-    for (const auto& [id, s] : topo.switches()) { SwitchRecord r = s; r.workerKnown = true; r.worker = worker; r.workerBoot = boot; e.switches.push_back(r); }
-    for (const auto& [id, p] : topo.ports()) { SwitchPortRecord r = p; r.workerKnown = true; r.worker = worker; r.workerBoot = boot; e.ports.push_back(r); }
-    for (const auto& [id, l] : topo.links()) { LinkRecord r = l; r.workerKnown = true; r.worker = worker; r.workerBoot = boot; e.links.push_back(r); }
-    for (const auto& [id, p] : topo.partitions()) { FabricPartition r = p; r.workerKnown = true; r.worker = worker; r.workerBoot = boot; e.partitions.push_back(r); }
+    for (const auto& [id, s] : topo.switches()) {
+        SwitchRecord r = s; r.workerKnown = true; r.worker = worker; r.workerBoot = boot;
+        if (auto o = cur->lookupSwitch(id); o && takeover(*o)) lift(r.gen, o->gen);
+        e.switches.push_back(r);
+    }
+    for (const auto& [id, p] : topo.ports()) {
+        SwitchPortRecord r = p; r.workerKnown = true; r.worker = worker; r.workerBoot = boot;
+        if (auto o = cur->lookupPort(id); o && takeover(*o)) lift(r.gen, o->gen);
+        e.ports.push_back(r);
+    }
+    for (const auto& [id, l] : topo.links()) {
+        LinkRecord r = l; r.workerKnown = true; r.worker = worker; r.workerBoot = boot;
+        if (auto o = cur->lookupLink(id); o && takeover(*o)) lift(r.gen, o->gen);
+        e.links.push_back(r);
+    }
+    for (const auto& [id, p] : topo.partitions()) {
+        FabricPartition r = p; r.workerKnown = true; r.worker = worker; r.workerBoot = boot;
+        if (auto o = cur->lookupPartition(id); o && takeover(*o)) lift(r.gen, o->gen);
+        e.partitions.push_back(r);
+    }
     (void)registry_.applyBulk(e);
 }
 
@@ -132,6 +155,13 @@ void Coordinator::handleConnection(std::shared_ptr<TcpSocket> sock, uint64_t con
     (void)connId;
     FrameStream stream;
     WorkerId worker; WorkerBootId boot = 0; bool registered = false;
+    // True while this connection's boot is the worker's active incarnation: once a newer boot
+    // registers, the superseded connection may no longer publish evidence.
+    auto activeIncarnation = [this, &worker, &boot]() {
+        std::lock_guard<std::mutex> lk(authMutex_);
+        auto it = activeBoot_.find(worker);
+        return it != activeBoot_.end() && it->second == boot;
+    };
     std::vector<uint8_t> buf(4096);
     for (;;) {
         auto rr = sock->recvSome(buf.data(), buf.size());
@@ -162,7 +192,7 @@ void Coordinator::handleConnection(std::shared_ptr<TcpSocket> sock, uint64_t con
                     break;
                 }
                 case MsgType::PUBLISH_TOPOLOGY: {
-                    if (!registered) break;
+                    if (!registered || !activeIncarnation()) break;
                     uint8_t ver; if (!r.u8(ver)) break;
                     uint64_t ep; if (!r.u64(ep)) break;
                     std::string wid; if (!r.str(wid)) break;
@@ -180,7 +210,7 @@ void Coordinator::handleConnection(std::shared_ptr<TcpSocket> sock, uint64_t con
                     break;
                 }
                 case MsgType::PUBLISH_MEASUREMENT: {
-                    if (!registered) break;
+                    if (!registered || !activeIncarnation()) break;
                     uint64_t ep; if (!r.u64(ep)) break;
                     if (ep != registry_.epoch()) break;
                     uint64_t src, dst, bytes, iters, nanos;
@@ -230,6 +260,9 @@ Result<void> Coordinator::persistTo(const std::string& path) const { return regi
 Result<void> Coordinator::restoreFromAndRevalidate(const std::string& path) {
     auto res = FabricRegistry::restoreFrom(path);
     if (!res.ok()) return Err(res.error());
+    // A restarted coordinator never reuses the epoch it persisted (nor an older one): workers of
+    // the previous incarnation would otherwise still be accepted.
+    if (res.value()->epoch() >= registry_.epoch()) registry_.setEpoch(res.value()->epoch() + 1);
     auto snap = res.value()->snapshot();
     FabricRegistry::BulkEdit e;
     for (const auto& [id, d] : snap->devices()) e.devices.push_back(d);
